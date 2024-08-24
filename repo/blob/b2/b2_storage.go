@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Backblaze/blazer/b2"
 	"github.com/pkg/errors"
 	"gopkg.in/kothar/go-backblaze.v0"
 
@@ -28,8 +29,8 @@ type b2Storage struct {
 	Options
 	blob.DefaultProviderImplementation
 
-	cli    *backblaze.B2
-	bucket *backblaze.Bucket
+	cli    *b2.Client
+	bucket *b2.Bucket
 }
 
 func (s *b2Storage) GetBlob(ctx context.Context, id blob.ID, offset, length int64, output blob.OutputBuffer) error {
@@ -39,28 +40,15 @@ func (s *b2Storage) GetBlob(ctx context.Context, id blob.ID, offset, length int6
 		return blob.ErrInvalidRange
 	}
 
+	if length == 0 {
+		return nil
+	}
+
 	output.Reset()
 
 	attempt := func() error {
-		var fileRange *backblaze.FileRange
-
-		if length > 0 {
-			fileRange = &backblaze.FileRange{
-				Start: offset,
-				End:   offset + length - 1,
-			}
-		}
-
-		_, r, err := s.bucket.DownloadFileRangeByName(fileName, fileRange)
-		if err != nil {
-			return errors.Wrap(err, "DownloadFileRangeByName")
-		}
-		defer r.Close() //nolint:errcheck
-
-		if length == 0 {
-			return nil
-		}
-
+		r := s.bucket.Object(fileName).NewRangeReader(ctx, offset, length)
+		defer r.Close()
 		return iocopy.JustCopy(output, r)
 	}
 
