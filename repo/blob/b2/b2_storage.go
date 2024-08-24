@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/Backblaze/blazer/b2"
@@ -60,41 +59,22 @@ func (s *b2Storage) GetBlob(ctx context.Context, id blob.ID, offset, length int6
 	return blob.EnsureLengthExactly(output.Length(), length)
 }
 
-func (s *b2Storage) resolveFileID(fileName string) (string, error) {
-	resp, err := s.bucket.ListFileVersions(fileName, "", 1)
-	if err != nil {
-		return "", errors.Wrap(err, "ListFileVersions")
-	}
-
-	if len(resp.Files) > 0 {
-		if resp.Files[0].Name == fileName && resp.Files[0].Action == backblaze.Upload {
-			return resp.Files[0].ID, nil
-		}
-	}
-
-	return "", nil
-}
-
 func (s *b2Storage) GetMetadata(ctx context.Context, id blob.ID) (blob.Metadata, error) {
 	fileName := s.getObjectNameString(id)
+	object := s.bucket.Object(fileName)
+	attrs, err := object.Attrs(ctx)
 
-	fileID, err := s.resolveFileID(fileName)
 	if err != nil {
 		return blob.Metadata{}, translateError(err)
 	}
 
-	fi, err := s.bucket.GetFileInfo(fileID)
-	if err != nil {
-		return blob.Metadata{}, errors.Wrap(translateError(err), "GetFileInfo")
-	}
-
 	bm := blob.Metadata{
 		BlobID:    id,
-		Length:    fi.ContentLength,
-		Timestamp: time.Unix(0, fi.UploadTimestamp*1e6),
+		Length:    attrs.Size,
+		Timestamp: attrs.UploadTimestamp,
 	}
 
-	if t, ok := timestampmeta.FromValue(fi.FileInfo[timeMapKey]); ok {
+	if t, ok := timestampmeta.FromValue(attrs.Info[timeMapKey]); ok {
 		bm.Timestamp = t
 	}
 
@@ -102,34 +82,34 @@ func (s *b2Storage) GetMetadata(ctx context.Context, id blob.ID) (blob.Metadata,
 }
 
 func translateError(err error) error {
-	if err == nil {
-		return nil
-	}
-
-	var b2err *backblaze.B2Error
-	if errors.As(err, &b2err) {
-		switch b2err.Status {
-		case http.StatusNotFound:
-			// Normal "not found". That's fine.
-			return blob.ErrBlobNotFound
-
-		case http.StatusBadRequest:
-			if b2err.Code == "already_hidden" || b2err.Code == "no_such_file" {
-				// Special case when hiding a file that is already hidden. It's basically
-				// not found.
-				return blob.ErrBlobNotFound
-			}
-
-			if b2err.Code == "bad_request" && strings.HasPrefix(b2err.Message, "Bad file") {
-				// returned in GetMetadata() when fileId is not found.
-				return blob.ErrBlobNotFound
-			}
-
-		case http.StatusRequestedRangeNotSatisfiable:
-			return blob.ErrInvalidRange
-		}
-	}
-
+	//	if err == nil {
+	//		return nil
+	//	}
+	//
+	//	var b2err *backblaze.B2Error
+	//	if errors.As(err, &b2err) {
+	//		switch b2err.Status {
+	//		case http.StatusNotFound:
+	//			// Normal "not found". That's fine.
+	//			return blob.ErrBlobNotFound
+	//
+	//		case http.StatusBadRequest:
+	//			if b2err.Code == "already_hidden" || b2err.Code == "no_such_file" {
+	//				// Special case when hiding a file that is already hidden. It's basically
+	//				// not found.
+	//				return blob.ErrBlobNotFound
+	//			}
+	//
+	//			if b2err.Code == "bad_request" && strings.HasPrefix(b2err.Message, "Bad file") {
+	//				// returned in GetMetadata() when fileId is not found.
+	//				return blob.ErrBlobNotFound
+	//			}
+	//
+	//		case http.StatusRequestedRangeNotSatisfiable:
+	//			return blob.ErrInvalidRange
+	//		}
+	//	}
+	//
 	return err
 }
 
