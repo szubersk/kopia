@@ -4,9 +4,6 @@ package b2
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
-	"time"
 
 	"github.com/Backblaze/blazer/b2"
 	"github.com/pkg/errors"
@@ -47,7 +44,8 @@ func (s *b2Storage) GetBlob(ctx context.Context, id blob.ID, offset, length int6
 
 	attempt := func() error {
 		r := s.bucket.Object(fileName).NewRangeReader(ctx, offset, length)
-		defer r.Close()
+		defer r.Close() //nolint:errcheck
+
 		return iocopy.JustCopy(output, r)
 	}
 
@@ -122,29 +120,35 @@ func (s *b2Storage) PutBlob(ctx context.Context, id blob.ID, data blob.Bytes, op
 	}
 
 	fileName := s.getObjectNameString(id)
+	object := s.bucket.Object(fileName)
+	reader := data.Reader()
+	writer := object.NewWriter(ctx, b2.WithAttrsOption(&b2.Attrs{Info: timestampmeta.ToMap(opts.SetModTime, timeMapKey)}))
 
-	// Backblaze always expects Content-Length to be set, even in http.Request ContentLength==0
-	// can mean "unknown" or "zero". http.Request used by B2 client requires http.NoBody to
-	// reliably pass zero length to the server as opposed to not passing it at all.
-	var r io.Reader = data.Reader()
-	if data.Length() == 0 {
-		r = http.NoBody
+	defer reader.Close() //nolint:errcheck
+
+	if err := iocopy.JustCopy(writer, reader); err != nil {
+		return translateError(err)
 	}
 
-	fi, err := s.bucket.UploadFile(fileName, timestampmeta.ToMap(opts.SetModTime, timeMapKey), r)
-	if err != nil {
+	if err := writer.Close(); err != nil {
 		return translateError(err)
 	}
 
 	if opts.GetModTime != nil {
-		*opts.GetModTime = time.Unix(0, fi.UploadTimestamp*1e6)
+		attrs, err := object.Attrs(ctx)
+		if err != nil {
+			return translateError(err)
+		}
+
+		*opts.GetModTime = attrs.UploadTimestamp
 	}
 
 	return nil
 }
 
 func (s *b2Storage) DeleteBlob(ctx context.Context, id blob.ID) error {
-	_, err := s.bucket.HideFile(s.getObjectNameString(id))
+	object := s.bucket.Object(s.getObjectNameString(id))
+	err := object.Hide(ctx)
 	err = translateError(err)
 
 	if errors.Is(err, blob.ErrBlobNotFound) {
@@ -163,37 +167,31 @@ func (s *b2Storage) ListBlobs(ctx context.Context, prefix blob.ID, callback func
 	const maxFileQuery = 1000
 
 	fullPrefix := s.getObjectNameString(prefix)
-	nextFile := ""
+	iter := s.bucket.List(ctx, b2.ListPageSize(maxFileQuery), b2.ListPrefix(fullPrefix))
 
-	for {
-		resp, err := s.bucket.ListFileNamesWithPrefix(nextFile, maxFileQuery, fullPrefix, "")
+	for iter.Next() {
+		attrs, err := iter.Object().Attrs(ctx)
 		if err != nil {
-			//nolint:wrapcheck
+			return translateError(err)
+		}
+
+		bm := blob.Metadata{
+			BlobID:    blob.ID(attrs.Name[len(s.Prefix):]),
+			Length:    attrs.Size,
+			Timestamp: attrs.LastModified,
+		}
+
+		if t, ok := timestampmeta.FromValue(attrs.Info[timeMapKey]); ok {
+			bm.Timestamp = t
+		}
+
+		if err := callback(bm); err != nil {
 			return err
 		}
+	}
 
-		for i := range resp.Files {
-			f := &resp.Files[i]
-			bm := blob.Metadata{
-				BlobID:    blob.ID(f.Name[len(s.Prefix):]),
-				Length:    f.ContentLength,
-				Timestamp: time.Unix(0, f.UploadTimestamp*int64(time.Millisecond)),
-			}
-
-			if t, ok := timestampmeta.FromValue(f.FileInfo[timeMapKey]); ok {
-				bm.Timestamp = t
-			}
-
-			if err := callback(bm); err != nil {
-				return err
-			}
-		}
-
-		nextFile = resp.NextFileName
-
-		if nextFile == "" {
-			break
-		}
+	if iter.Err() != nil {
+		return errors.Wrapf(iter.Err(), "unable to iterate over bucket %s", s.BucketName)
 	}
 
 	return nil
@@ -238,8 +236,8 @@ func New(ctx context.Context, opt *Options, isCreate bool) (blob.Storage, error)
 
 	return retrying.NewWrapper(&b2Storage{
 		Options: *opt,
-		cli:     cli,
-		bucket:  bucket,
+		cli:     nil,
+		bucket:  nil,
 	}), nil
 }
 
